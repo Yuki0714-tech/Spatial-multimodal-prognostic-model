@@ -916,3 +916,545 @@ legend("bottomleft",
        col = c("#fc8d62", "#66c2a5", "#8da0cb", "#e78ac3"),
        lty = 1, lwd = 2)
 
+###scRNA-seq associated analysis###
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(tidyverse)
+  library(ggplot2)
+  library(dplyr)
+  library(Matrix)
+  library(harmony)
+  library(copykat)
+
+  # plotting
+  library(scplotter)
+  library(cowplot)
+  library(ggpubr)
+  library(pheatmap)
+  library(colorspace)
+
+  # enrichment
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+
+  # GSVA
+  library(GSEABase)
+  library(GSVA)
+  library(BiocParallel)
+})
+
+options(stringsAsFactors = FALSE)
+set.seed(10086)
+
+############################
+# Paths and outputs
+############################
+root_dir <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+
+# Input
+sce_rds <- file.path(root_dir, "sce.rds")
+
+# Optional inputs
+hallmark_gmt <- file.path(root_dir, "ssGSEA", "hallmark.gmt")  # change if needed
+
+# Outputs
+out_dir <- file.path(root_dir, "outputs_tumor_epi")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+rds_dir <- file.path(out_dir, "rds")
+fig_dir <- file.path(out_dir, "figures")
+tbl_dir <- file.path(out_dir, "tables")
+dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(tbl_dir, showWarnings = FALSE, recursive = TRUE)
+
+############################
+# Parameters
+############################
+marker_genes <- c("PAN2", "PLEKHA6", "CLIC3", "AGR2")
+marker_coef  <- c(-0.3409, -0.2265, 0.2645, 0.3313)
+names(marker_coef) <- marker_genes
+
+# Epithelial copyKat visualization: Harmony + UMAP
+epi_harmony_dims <- 1:20
+
+# Tumor aneuploid subset integration (Seurat v5 IntegrateLayers CCA)
+tumor_hvg_nfeatures <- 5000
+tumor_integrated_dims <- 1:20
+
+# Tumor clustering
+tumor_resolution <- 0.3
+tumor_cluster_col <- "RNA_snn_res.0.3"
+
+# Marker calling
+markers_min_pct <- 0.3
+markers_logfc   <- 1
+
+# Enrichment
+go_p_cut <- 0.05
+go_q_cut <- 0.05
+kegg_p_cut <- 0.05
+
+# ssGSEA
+ssgsea_hvg_nfeatures <- 8000
+
+############################
+# functions
+############################
+save_pdf <- function(p, filename, w = 7, h = 6) {
+  ggsave(filename = file.path(fig_dir, filename), plot = p, width = w, height = h)
+}
+
+safe_read_gmt <- function(gmt_path) {
+  if (!file.exists(gmt_path)) {
+    stop("GMT file not found: ", gmt_path)
+  }
+  gmt <- clusterProfiler::read.gmt(gmt_path)
+  split(gmt$gene, gmt$term)
+}
+
+compute_riskscore <- function(seu, genes, coef_vec) {
+  exp <- FetchData(seu, vars = genes)
+  for (g in genes) {
+    if (!g %in% colnames(exp)) stop("Gene not found in object: ", g)
+    exp[, g] <- exp[, g] * coef_vec[g]
+  }
+  rowSums(exp[, genes, drop = FALSE])
+}
+
+run_harmony_umap <- function(seu, batch = "orig.ident", dims = 1:20) {
+  seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = 1e4)
+  seu <- FindVariableFeatures(seu)
+  seu <- ScaleData(seu)
+  seu <- RunPCA(seu, features = VariableFeatures(seu))
+  seu <- RunHarmony(seu, batch)
+  seu <- RunUMAP(seu, dims = dims, reduction = "harmony")
+  seu
+}
+
+run_cca_integrate <- function(seu, split_by = "orig.ident", nfeatures = 5000, dims = 1:20) {
+  # Seurat v5 layers workflow
+  seu[["RNA"]] <- split(seu[["RNA"]], f = seu[[split_by]][, 1])
+
+  seu <- NormalizeData(seu)
+  seu <- FindVariableFeatures(seu, selection.method = "vst", nfeatures = nfeatures)
+  seu <- ScaleData(seu)
+  seu <- RunPCA(seu)
+
+  seu <- IntegrateLayers(
+    object = seu,
+    method = CCAIntegration,
+    orig.reduction = "pca",
+    new.reduction = "integrated.cca",
+    verbose = FALSE
+  )
+
+  # re-join layers after integration
+  seu[["RNA"]] <- JoinLayers(seu[["RNA"]])
+
+  seu <- FindNeighbors(seu, dims = dims, reduction = "integrated.cca")
+  seu <- RunUMAP(seu, dims = dims, reduction = "integrated.cca")
+  seu
+}
+
+############################
+# Load Seurat object + extract epithelial
+############################
+if (!file.exists(sce_rds)) stop("sce.rds not found: ", sce_rds)
+sce <- readRDS(sce_rds)
+
+if (!"celltype" %in% colnames(sce@meta.data)) {
+  stop("Meta column 'celltype' not found in sce.rds.")
+}
+
+sce_epi <- subset(sce, subset = celltype == "Epithelial cell")
+rm(sce); gc()
+
+# Ensure copyKat exists
+if (!"copyKat" %in% colnames(sce_epi@meta.data)) {
+  sce_epi$copyKat <- NA
+}
+sce_epi$copyKat[is.na(sce_epi$copyKat)] <- "diploid"
+
+saveRDS(sce_epi, file.path(rds_dir, "sce_epi.rds"))
+
+############################
+# CopyKAT visualization (Harmony UMAP)
+############################
+sce_epi_h <- run_harmony_umap(sce_epi, batch = "orig.ident", dims = epi_harmony_dims)
+Idents(sce_epi_h) <- sce_epi_h$copyKat
+
+p_copykat <- CellDimPlot(sce_epi_h, group_by = "copyKat", reduction = "umap")
+save_pdf(p_copykat, "copyKat_epithelial_umap.pdf", w = 7, h = 6)
+
+saveRDS(sce_epi_h, file.path(rds_dir, "sce_epi_harmony_umap.rds"))
+
+############################
+# Tumor epithelial (aneuploid) subset + integration
+############################
+sce_tumor_rds <- file.path(rds_dir, "sce_tumor.rds")
+
+if (file.exists(sce_tumor_rds)) {
+  sce_tumor <- readRDS(sce_tumor_rds)
+} else {
+  sce_tumor <- subset(sce_epi_h, subset = copyKat == "aneuploid")
+  saveRDS(sce_tumor, sce_tumor_rds)
+}
+
+# Integration via CCA (recommended for multi-dataset tumor epithelial subset)
+sce_tumor_int <- run_cca_integrate(
+  sce_tumor,
+  split_by = "orig.ident",
+  nfeatures = tumor_hvg_nfeatures,
+  dims = tumor_integrated_dims
+)
+
+# Clustering on integrated.cca
+sce_tumor_int <- FindClusters(sce_tumor_int, resolution = tumor_resolution)
+saveRDS(sce_tumor_int, file.path(rds_dir, "sce_tumor_integrated_cca.rds"))
+
+############################
+# Harmony-based alternative 
+############################
+sce_tumor_h <- sce_tumor
+sce_tumor_h <- NormalizeData(sce_tumor_h, normalization.method = "LogNormalize", scale.factor = 1e4)
+sce_tumor_h <- FindVariableFeatures(sce_tumor_h)
+sce_tumor_h <- ScaleData(sce_tumor_h)
+sce_tumor_h <- RunHarmony(sce_tumor_h, "orig.ident")
+sce_tumor_h <- FindNeighbors(sce_tumor_h, reduction = "harmony")
+sce_tumor_h <- FindClusters(sce_tumor_h, resolution = tumor_resolution)
+sce_tumor_h <- RunUMAP(sce_tumor_h, dims = 1:20, reduction = "harmony")
+saveRDS(sce_tumor_h, file.path(rds_dir, "sce_tumor_harmony.rds"))
+
+# Use Harmony object as "final tumor" for downstream (matches your original usage)
+sce_tumor_final <- sce_tumor_h
+
+############################
+#  Rename clusters to C1–C8 
+############################
+if (!tumor_cluster_col %in% colnames(sce_tumor_final@meta.data)) {
+  stop("Expected cluster column not found: ", tumor_cluster_col)
+}
+
+Idents(sce_tumor_final) <- sce_tumor_final[[tumor_cluster_col]][, 1]
+
+new.cluster.ids <- c(
+  "0" = "C1",
+  "1" = "C2",
+  "2" = "C3",
+  "3" = "C4",
+  "4" = "C5",
+  "5" = "C6",
+  "6" = "C7",
+  "7" = "C8"
+)
+
+sce_tumor_final <- RenameIdents(sce_tumor_final, new.cluster.ids)
+sce_tumor_final[[tumor_cluster_col]] <- as.character(Idents(sce_tumor_final))
+saveRDS(sce_tumor_final, file.path(rds_dir, "sce_tumor_C1C8.rds"))
+
+############################
+# Marker discovery + heatmap
+############################
+scRNA.markers <- FindAllMarkers(
+  sce_tumor_final,
+  only.pos = TRUE,
+  min.pct = markers_min_pct,
+  logfc.threshold = markers_logfc
+)
+
+top_50 <- scRNA.markers %>%
+  group_by(cluster) %>%
+  top_n(n = 50, wt = avg_log2FC)
+
+write.csv(scRNA.markers, file.path(tbl_dir, "tumor_C1C8_all_markers.csv"), row.names = FALSE)
+write.csv(top_50, file.path(tbl_dir, "tumor_C1C8_top50_markers.csv"), row.names = FALSE)
+
+# Heatmap top5 (per cluster)
+top_5 <- scRNA.markers %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC)
+
+# Ensure scale.genes defined before use
+scale.genes <- VariableFeatures(sce_tumor_final)
+sce_tumor_final <- ScaleData(
+  sce_tumor_final,
+  features = unique(c(scale.genes, "FAM183A", "MAP3K19", "C1orf194", "PVRL1", "RP1-27K12.2"))
+)
+
+p_heat <- DoHeatmap(
+  sce_tumor_final,
+  features = unique(as.character(top_5$gene)),
+  group.by = tumor_cluster_col,
+  assay = "RNA"
+) + scale_fill_gradientn(colors = c("#ece7f2","#a6bddb","#2b8cbe"))
+
+save_pdf(p_heat, "tumor_C1C8_top_markers_heatmap.pdf", w = 10, h = 5)
+
+############################
+#  UMAP + dotplot of PAN2/PLEKHA6/CLIC3/AGR2
+############################
+p_umap <- CellDimPlot(
+  sce_tumor_final,
+  group_by = tumor_cluster_col,
+  reduction = "umap",
+  label = TRUE,
+  label_fg = "orange",
+  label_bg = "white",
+  label_size = 5
+)
+save_pdf(p_umap, "umap_C1_C8.pdf", w = 7, h = 5)
+
+p_dot <- DotPlot(sce_tumor_final, features = marker_genes) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  labs(x = NULL, y = NULL)
+save_pdf(p_dot, "C1_C8_marker_dotplot.pdf", w = 4, h = 4)
+
+############################
+# Riskscore (violin + UMAP overlay)
+############################
+rs <- compute_riskscore(sce_tumor_final, marker_genes, marker_coef)
+sce_tumor_final$riskscore <- rs
+saveRDS(sce_tumor_final, file.path(rds_dir, "sce_tumor_C1C8_with_riskscore.rds"))
+
+metadata_subset <- sce_tumor_final@meta.data[, c(tumor_cluster_col, "riskscore")]
+col_palette <- c(
+  "#a6cee3","#1f78b4","#b2df8a","#33a02c",
+  "#fdbf6f","#ff7f00","#fb9a99","#e31a1c","#cab2d6"
+)
+
+c2_mean <- mean(metadata_subset$riskscore[metadata_subset[[tumor_cluster_col]] == "C2"], na.rm = TRUE)
+
+p_violin <- ggviolin(
+  metadata_subset,
+  x = tumor_cluster_col,
+  y = "riskscore",
+  color = tumor_cluster_col,
+  trim = TRUE,
+  size = 0.2,
+  palette = col_palette,
+  scale = "width",
+  add = c("mean_sd")
+) +
+  labs(title = "", x = "", y = "riskscore") +
+  theme(
+    legend.title = element_blank(),
+    axis.text = element_text(size = 14),
+    axis.title = element_text(size = 14)
+  ) +
+  geom_hline(yintercept = c2_mean, colour = "gray", linetype = "dashed") +
+  scale_y_continuous(limits = c(0, 1.5), breaks = seq(0, 1.5, 0.5))
+
+save_pdf(p_violin, "riskscore_C1_C8_violin.pdf", w = 5, h = 4)
+
+# UMAP overlay
+umap_df <- as.data.frame(sce_tumor_final@reductions$umap@cell.embeddings)
+umap_df$cell <- rownames(umap_df)
+rs_df <- sce_tumor_final@meta.data[, c("riskscore"), drop = FALSE] %>%
+  rownames_to_column("cell")
+plot_df <- left_join(umap_df, rs_df, by = "cell")
+
+p_rs_umap <- ggplot(plot_df) +
+  geom_point(aes(x = umap_1, y = umap_2, color = riskscore), size = 0.5, shape = 16) +
+  scale_color_viridis_c(option = "inferno", name = "Riskscore") +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    axis.text = element_text(color = "black", size = 12),
+    axis.title = element_text(color = "black", size = 14),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+save_pdf(p_rs_umap, "Riskscore_umap_tumor_C1_C8.pdf", w = 5, h = 4)
+
+############################
+# GO/KEGG enrichment for C2 markers
+############################
+markers_loose <- FindAllMarkers(
+  sce_tumor_final,
+  only.pos = TRUE,
+  min.pct = 0.3,
+  logfc.threshold = 0.5
+)
+
+markers_C2 <- markers_loose %>% filter(cluster == "C2")
+
+ids <- bitr(markers_C2$gene, "SYMBOL", "ENTREZID", org.Hs.eg.db)
+markers_C2_ids <- merge(markers_C2, ids, by.x = "gene", by.y = "SYMBOL")
+gene_list <- unique(markers_C2_ids$ENTREZID)
+
+go_res <- enrichGO(
+  gene = gene_list,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff = go_p_cut,
+  qvalueCutoff = go_q_cut
+)
+go_tbl <- as.data.frame(go_res)
+write.csv(go_tbl, file.path(tbl_dir, "GO_C2_full.csv"), row.names = FALSE)
+
+kegg_res <- enrichKEGG(
+  gene = gene_list,
+  organism = "hsa",
+  pvalueCutoff = kegg_p_cut
+)
+kegg_tbl <- as.data.frame(kegg_res)
+write.csv(kegg_tbl, file.path(tbl_dir, "KEGG_C2_full.csv"), row.names = FALSE)
+
+############################
+# Hallmark ssGSEA (GSVA) + heatmap + correlation with riskscore (C2)
+############################
+if (file.exists(hallmark_gmt)) {
+  genesets_hall <- safe_read_gmt(hallmark_gmt)
+
+  sce_tumor_final <- FindVariableFeatures(sce_tumor_final, nfeatures = ssgsea_hvg_nfeatures)
+  scale.genes2 <- VariableFeatures(sce_tumor_final)
+
+  expr <- as.matrix(GetAssayData(sce_tumor_final, layer = "data", assay = "RNA")[scale.genes2, ])
+
+  params <- gsvaParam(
+    expr = expr,
+    genesets_hall,
+    minSize = 3,
+    maxSize = Inf,
+    kcdf = "Gaussian",
+    tau = 1,
+    maxDiff = TRUE,
+    absRanking = FALSE
+  )
+
+  gsva_result <- gsva(
+    params,
+    verbose = TRUE,
+    BPPARAM = BiocParallel::SerialParam(progressbar = TRUE)
+  )
+
+  ssgsea_scores <- as.data.frame(t(gsva_result))
+  sce_tumor_final <- AddMetaData(sce_tumor_final, ssgsea_scores)
+
+  cluster_info_df <- data.frame(
+    cell_name = colnames(sce_tumor_final),
+    cluster = sce_tumor_final@meta.data[[tumor_cluster_col]],
+    stringsAsFactors = FALSE
+  )
+
+  ssgsea_scores$cell_name <- rownames(ssgsea_scores)
+  ssgsea_scores <- merge(ssgsea_scores, cluster_info_df, by = "cell_name")
+  rownames(ssgsea_scores) <- ssgsea_scores$cell_name
+  ssgsea_scores$cell_name <- NULL
+
+  avg_ssgsea_scores <- ssgsea_scores %>%
+    group_by(cluster) %>%
+    summarise(across(everything(), mean), .groups = "drop") %>%
+    column_to_rownames("cluster")
+
+  pdf(file.path(fig_dir, "hallmark_C1_C8_heatmap.pdf"), width = 8, height = 12)
+  pheatmap(
+    t(avg_ssgsea_scores),
+    cluster_rows = TRUE,
+    cluster_cols = FALSE,
+    scale = "row",
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    border_color = "white",
+    color = colorRampPalette(c("#2ca02c", "white", "#ff7f0e"))(100)
+  )
+  dev.off()
+
+  # Correlation with riskscore within C2
+  ssgsea_C2 <- ssgsea_scores %>% filter(cluster == "C2")
+  # drop cluster column
+  ssgsea_C2_mat <- ssgsea_C2 %>% select(-cluster)
+
+  # align riskscore
+  rs_C2 <- sce_tumor_final@meta.data[sce_tumor_final@meta.data[[tumor_cluster_col]] == "C2", "riskscore"]
+  n_cor <- cbind(riskscore = rs_C2, ssgsea_C2_mat)
+
+  cor_matrix <- cor(n_cor %>% select(-riskscore), n_cor$riskscore, method = "pearson")
+
+  pdf(file.path(fig_dir, "Pearson_Correlation_C2_heatmap.pdf"), width = 6, height = 12)
+  pheatmap(
+    as.matrix(cor_matrix),
+    cluster_rows = TRUE,
+    cluster_cols = FALSE,
+    display_numbers = TRUE,
+    border_color = "white",
+    number_format = "%.2f",
+    color = colorRampPalette(c("#2ca02c", "white", "#ff7f0e"))(50),
+    main = "Pearson correlation with riskscore (C2)",
+    fontsize_number = 10,
+    fontsize = 12
+  )
+  dev.off()
+
+  # Example scatter panels (edit pathways if needed)
+  pick_paths <- c(
+    "ESTROGEN_RESPONSE_LATE",
+    "ESTROGEN_RESPONSE_EARLY",
+    "KRAS_SIGNALING_UP",
+    "TNFA_SIGNALING_VIA_NFKB"
+  )
+  pick_paths <- pick_paths[pick_paths %in% colnames(n_cor)]
+
+  plist <- list()
+  colors_sc <- c("#a6cee3", "#1f78b4", "#b2df8a", "#33a02c")
+  for (i in seq_along(pick_paths)) {
+    y_var <- pick_paths[i]
+    p <- ggscatter(
+      n_cor, x = "riskscore", y = y_var,
+      add = "reg.line", conf.int = TRUE,
+      add.params = list(fill = "lightgray"),
+      color = colors_sc[min(i, length(colors_sc))],
+      alpha = 0.1,
+      size = 0.7
+    ) +
+      stat_cor(method = "pearson") +
+      labs(title = y_var)
+    plist[[i]] <- p
+  }
+
+  if (length(plist) > 0) {
+    p_arr <- ggarrange(plotlist = plist, ncol = 2, nrow = ceiling(length(plist) / 2))
+    save_pdf(p_arr, "pearson_selected_pathways_C2.pdf", w = 6, h = 6)
+  }
+
+} else {
+  message("Hallmark GMT not found, skipping ssGSEA/GSVA: ", hallmark_gmt)
+}
+
+############################
+#  Coef contribution (C2)
+############################
+dir.create(file.path(out_dir, "contribution"), showWarnings = FALSE, recursive = TRUE)
+contrib_dir <- file.path(out_dir, "contribution")
+
+scRNA_C2 <- subset(sce_tumor_final, subset = .data[[tumor_cluster_col]] == "C2")
+exp_C2 <- FetchData(scRNA_C2, vars = marker_genes)
+
+for (g in marker_genes) exp_C2[, g] <- exp_C2[, g] * marker_coef[g]
+gene_sum <- colSums(exp_C2)
+
+df_weight <- data.frame(marker = marker_genes, sum = as.numeric(gene_sum))
+p_w <- ggplot(df_weight, aes(x = marker, y = sum, fill = marker)) +
+  geom_col(position = "fill") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggsave(file.path(contrib_dir, "C2_coef_weight.pdf"), plot = p_w, width = 3, height = 3)
+
+df_stack <- df_weight
+df_stack$sum_signed <- df_stack$sum
+df_stack$sum_signed[df_stack$marker %in% names(marker_coef[marker_coef < 0])] <- -abs(df_stack$sum_signed[df_stack$marker %in% names(marker_coef[marker_coef < 0])])
+
+p_s <- ggplot(df_stack, aes(x = marker, y = sum_signed, fill = marker)) +
+  geom_col(position = "stack") +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+ggsave(file.path(contrib_dir, "C2_coef_exp.pdf"), plot = p_s, width = 3, height = 3)
+
